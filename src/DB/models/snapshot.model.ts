@@ -28,6 +28,10 @@ export const SnapshotSchema = new Schema<ISnapshot>(
       type: Schema.Types.Mixed,
       default: {},
     },
+    lastEventId: {
+      type: String,
+      default: "",
+    },
   },
   { timestamps: true },
 );

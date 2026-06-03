@@ -37,21 +37,18 @@ const captureVoidHoldSchema = {
   }),
 };
 
-// حجز وفتح الحسابات
 router.post(
   "/accounts",
   validate(openAccountSchema),
   controller.open_account.bind(controller),
 );
 
-// التحويلات المالية (Double-entry)
 router.post(
   "/transfers",
   validate(transferSchema),
   controller.transfer.bind(controller),
 );
 
-// إدارة الـ Holds (Two-phase actions)
 router.post(
   "/holds",
   validate(placeHoldSchema),
@@ -69,6 +66,7 @@ router.post(
 );
 
 router.get("/accounts/:id/balance", controller.get_balance.bind(controller));
+router.get("/accounts/:id/statement", controller.get_statement.bind(controller));
 
 router.get(
   "/verification/invariants",

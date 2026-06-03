@@ -1,47 +1,35 @@
+import mongoose from "mongoose";
 import type { ClientSession } from "mongoose";
 import { EventModel } from "../DB/models/event.model.js";
 import { SnapshotModel } from "../DB/models/snapshot.model.js";
 import { IdempotencyModel } from "../DB/models/idempotency.model.js";
-import { ApiError } from "../middlewares/error.handler.middleware.js";
 
-const SYSTEM_SETTLEMENT_ACCOUNT_ID = "__system_settlement__";
+export type AccountType = "customer" | "system" | "liability";
+export type HoldStatus = "pending" | "captured" | "voided";
 
-// --- الـ Types المكتوبة بـ small/snake_case عشان تناسب معاييرك ---
-
-export type account_type = "customer" | "system" | "liability";
-export type hold_status = "pending" | "captured" | "voided";
-
-export interface hold_info {
+export interface HoldInfo {
   holdId: string;
   accountId: string;
   amount: number;
-  status: hold_status;
+  status: HoldStatus;
 }
 
-export interface account_state {
+export interface AccountState {
   accountId: string;
-  type: account_type;
+  type: AccountType;
   availableBalance: number;
   pendingBalance: number;
-  holds: Record<string, hold_info>;
+  holds: Record<string, HoldInfo>;
 }
 
-// الـ Discriminated Unions للأحداث بـ حروف صغيرة
-export type ledger_event_data =
-  | { type: "account_opened"; accountId: string; accountType: account_type }
-  | {
-      type: "money_transferred";
-      fromAccountId: string;
-      toAccountId: string;
-      amount: number;
-    }
-  | { type: "hold_placed"; accountId: string; holdId: string; amount: number }
-  | { type: "hold_captured"; holdId: string; accountId: string; amount: number }
-  | { type: "hold_voided"; holdId: string; accountId: string; amount: number };
+export interface AccountStateWithVersion {
+  state: AccountState;
+  version: number;
+  lastEventId: string;
+}
 
-// الـ Discriminated Unions للأوامر بـ حروف صغيرة
-export type ledger_command =
-  | { type: "open_account"; accountId: string; accountType: account_type }
+export type LedgerCommand =
+  | { type: "open_account"; accountId: string; accountType: AccountType }
   | {
       type: "transfer";
       fromAccountId: string;
@@ -52,234 +40,432 @@ export type ledger_command =
   | { type: "capture_hold"; holdId: string; accountId: string }
   | { type: "void_hold"; holdId: string; accountId: string };
 
-// --- الـ Core Ledger Engine ---
+export type LedgerEventData =
+  | { type: "account_opened"; accountId: string; accountType: AccountType }
+  | {
+      type: "transfer_debit";
+      fromAccountId: string;
+      toAccountId: string;
+      amount: number;
+    }
+  | {
+      type: "transfer_credit";
+      fromAccountId: string;
+      toAccountId: string;
+      amount: number;
+    }
+  | { type: "hold_placed"; accountId: string; holdId: string; amount: number }
+  | {
+      type: "hold_captured";
+      accountId: string;
+      holdId: string;
+      amount: number;
+    }
+  | { type: "hold_voided"; accountId: string; holdId: string; amount: number };
+
+export interface LedgerEventDocument {
+  _id?: string;
+  commandId: string;
+  idempotencyKey: string;
+  aggregateId: string;
+  version: number;
+  timestamp: number;
+  data: LedgerEventData;
+}
+
+export interface ProcessResult {
+  success: true;
+  command: LedgerCommand["type"];
+}
+
+export interface AccountStatementLine {
+  eventId: string;
+  commandId: string;
+  timestamp: number;
+  type: LedgerEventData["type"];
+  data: LedgerEventData;
+  availableBalance: number;
+  pendingBalance: number;
+  totalBalance: number;
+}
+
+export interface InvariantReport {
+  status: "SUCCESS" | "FAILED";
+  errors: string[];
+  globalBalance: number;
+  inspectedAccounts: number;
+}
+
+const INTERNAL_SETTLEMENT_ACCOUNT_ID = "__system_settlement__";
+const TRANSACTION_RETRY_LIMIT = 3;
 
 export class LedgerEngine {
-  /**
-   * 1. الـ Reducer الحتمي (apply_event)
-   * بياخد الحالة والحدث، ويرجع حالة جديدة تماماً بدون تعديل القديمة (Immutable)
-   */
-  public static apply_event(
-    state: account_state,
-    event: ledger_event_data,
-  ): account_state {
-    // deep clone عشان نحافظ على الـ immutability
-    const new_state = JSON.parse(JSON.stringify(state)) as account_state;
+  private static readonly eventsProjection = {
+    __v: 0,
+  };
 
-    switch (event.type) {
-      case "account_opened":
-        new_state.type = event.accountType;
-        new_state.availableBalance = 0;
-        new_state.pendingBalance = 0;
-        new_state.holds = {};
-        break;
-
-      case "money_transferred":
-        if (state.accountId === event.fromAccountId) {
-          new_state.availableBalance -= event.amount;
-        }
-        if (state.accountId === event.toAccountId) {
-          new_state.availableBalance += event.amount;
-        }
-        break;
-
-      case "hold_placed":
-        if (state.accountId === event.accountId) {
-          new_state.availableBalance -= event.amount;
-          new_state.pendingBalance += event.amount;
-          if (!new_state.holds) new_state.holds = {};
-          new_state.holds[event.holdId] = {
-            holdId: event.holdId,
-            accountId: event.accountId,
-            amount: event.amount,
-            status: "pending",
-          };
-        }
-        break;
-
-      case "hold_captured":
-        if (state.accountId === event.accountId) {
-          const hold = new_state.holds?.[event.holdId];
-          if (hold && hold.status === "pending") {
-            new_state.pendingBalance -= hold.amount;
-            hold.status = "captured";
-          }
-        }
-        break;
-
-      case "hold_voided":
-        if (state.accountId === event.accountId) {
-          const hold = new_state.holds?.[event.holdId];
-          if (hold && hold.status === "pending") {
-            new_state.availableBalance += hold.amount;
-            new_state.pendingBalance -= hold.amount;
-            hold.status = "voided";
-          }
-        }
-        break;
-
-      default:
-        // التأكد التام بـ TypeScript إننا غطينا كل الـ Events
-        const _exhaustive_check: never = event;
-        throw new Error(`Unhandled event type`);
+  public async processCommand(
+    command: LedgerCommand,
+    idempotencyKey: string,
+  ): Promise<ProcessResult> {
+    if (!idempotencyKey?.trim()) {
+      throw new Error("Idempotency-Key is required");
     }
 
-    return new_state;
-  }
+    return this.executeWithRetry(async (session) => {
+      const existingIdempotency = await IdempotencyModel.findOne({
+        idempotencyKey,
+      })
+        .session(session)
+        .lean();
 
-  /**
-   * 2. حساب رصيد وحالة الحساب الحالية (Replay من آخر Snapshot + Events)
-   */
-  public async get_account_state(
-    account_id: string,
-    session?: ClientSession,
-  ): Promise<{ state: account_state; version: number }> {
-    // سحب آخر لقطة متسيفة في الـ DB
-    const snapshot = await SnapshotModel.findOne({ accountId: account_id })
-      .session(session || null)
-      .lean();
-
-    let current_state: account_state = snapshot
-      ? {
-          accountId: snapshot.accountId,
-          type: snapshot.type as account_type,
-          availableBalance: snapshot.availableBalance,
-          pendingBalance: snapshot.pendingBalance,
-          holds: (snapshot.holds as Record<string, hold_info>) || {},
+      if (existingIdempotency) {
+        if (existingIdempotency.status === "completed") {
+          return existingIdempotency.response as ProcessResult;
         }
-      : {
-          accountId: account_id,
-          type:
-            account_id === SYSTEM_SETTLEMENT_ACCOUNT_ID ? "system" : "customer",
-          availableBalance: 0,
-          pendingBalance: 0,
-          holds: {},
-        };
 
-    let current_version = snapshot ? snapshot.version : 0;
+        if (existingIdempotency.status === "processing") {
+          throw new Error("Idempotency-Key is already being processed");
+        }
+      }
 
-    // جلب الأحداث اللي نزلت بعد الـ Snapshot ده بالترتيب التصاعدي
-    const events = await EventModel.find({
-      aggregateId: account_id,
-      version: { $gt: current_version },
-    })
-      .sort({ version: 1 })
-      .session(session || null)
-      .lean();
-
-    // تشغيل الـ Replay حتة حتة
-    for (const ev of events) {
-      current_state = LedgerEngine.apply_event(
-        current_state,
-        ev.data as ledger_event_data,
-      );
-      current_version = ev.version;
-    }
-
-    return { state: current_state, version: current_version };
-  }
-
-  /**
-   * 3. معالجة الأوامر وتطبيق شروط الأمان (Process Command)
-   */
-  public async process_command(
-    command: ledger_command,
-    idempotency_key: string,
-    session?: ClientSession,
-  ): Promise<any> {
-    const sessionOptions = session ? { session } : undefined;
-
-    const upsertResult: any = await IdempotencyModel.findOneAndUpdate<any>(
-      { idempotencyKey: idempotency_key } as any,
-      {
-        $setOnInsert: {
-          idempotencyKey: idempotency_key,
-          status: "processing",
-          createdAt: new Date(),
-        },
-      },
-      {
-        upsert: true,
-        new: true,
-        rawResult: true,
-        session: session ?? null,
-        setDefaultsOnInsert: true,
-      },
-    );
-
-    const idempotency_record = upsertResult.value as {
-      status: string;
-      response: unknown;
-    } | null;
-    const wasInserted = upsertResult.lastErrorObject?.updatedExisting === false;
-
-    if (idempotency_record?.status === "completed") {
-      return idempotency_record.response;
-    }
-
-    if (!wasInserted && idempotency_record?.status === "processing") {
-      throw new ApiError("Idempotency key is already in progress", 409);
-    }
-
-    // تجميع الحسابات المتأثرة بالأمر ده
-    const affected_accounts = this.get_affected_accounts(command);
-
-    // ترقية للأمان: ترتيب الحسابات أبجدياً/تصاعدياً لمنع الـ Deadlock تماماً (Deadlock-free Locking)
-    affected_accounts.sort();
-
-    // سحب الـ States الحالية لكل حساب داخل في العملية بالترتيب مع قفل الأسطر (Row-level lock)
-    const account_states: Record<
-      string,
-      { state: account_state; version: number }
-    > = {};
-    for (const id of affected_accounts) {
-      account_states[id] = await this.get_account_state(id, session);
-    }
-
-    // الـ Validation وبناء الأحداث الجديدة
-    const generated_events = this.validate_and_build_events(
-      command,
-      account_states,
-      idempotency_key,
-    );
-
-    // تسجيل الأحداث وتحديث الـ Snapshots دورياً (Compaction) داخل الـ Session
-    for (const out_event of generated_events) {
-      await EventModel.create([out_event], sessionOptions);
-
-      const target_id = out_event.aggregateId;
-      const { state: updated_state } = await this.get_account_state(
-        target_id,
-        session,
+      await IdempotencyModel.create(
+        [
+          {
+            idempotencyKey,
+            status: "processing",
+          },
+        ],
+        { session },
       );
 
-      await SnapshotModel.updateOne(
-        { accountId: target_id },
+      const affectedAccounts = this.getAffectedAccounts(command).sort();
+      const accountStates: Record<string, AccountStateWithVersion> = {};
+      for (const accountId of affectedAccounts) {
+        accountStates[accountId] = await this.getAccountState(
+          accountId,
+          session,
+        );
+      }
+
+      const events = this.buildEvents(command, accountStates, idempotencyKey);
+      if (!this.verifyBalance(events)) {
+        throw new Error("Generated events are not balanced");
+      }
+
+      await EventModel.insertMany(
+        events.map((event) => ({
+          commandId: event.commandId,
+          idempotencyKey: event.idempotencyKey,
+          aggregateId: event.aggregateId,
+          version: event.version,
+          timestamp: event.timestamp,
+          data: event.data,
+        })),
+        { session },
+      );
+
+      const updatedAccountIds = Array.from(
+        new Set(events.map((event) => event.aggregateId)),
+      ).sort();
+
+      for (const accountId of updatedAccountIds) {
+        const updatedState = await this.getAccountState(accountId, session);
+        await SnapshotModel.updateOne(
+          { accountId },
+          {
+            $set: {
+              version: updatedState.version,
+              type: updatedState.state.type,
+              availableBalance: updatedState.state.availableBalance,
+              pendingBalance: updatedState.state.pendingBalance,
+              holds: updatedState.state.holds,
+              lastEventId: updatedState.lastEventId,
+            },
+          },
+          { upsert: true, session },
+        );
+      }
+
+      const response: ProcessResult = {
+        success: true,
+        command: command.type,
+      };
+
+      await IdempotencyModel.updateOne(
+        { idempotencyKey },
         {
           $set: {
-            version: out_event.version,
-            type: updated_state.type,
-            availableBalance: updated_state.availableBalance,
-            pendingBalance: updated_state.pendingBalance,
-            holds: updated_state.holds,
+            status: "completed",
+            response,
+            updatedAt: new Date(),
           },
         },
-        session ? { upsert: true, session } : { upsert: true },
+        { session },
       );
-    }
 
-    const response_data = { success: true, command: command.type };
-    await IdempotencyModel.updateOne(
-      { idempotencyKey: idempotency_key },
-      { $set: { status: "completed", response: response_data } },
-      session ? { session } : undefined,
-    );
-
-    return response_data;
+      return response;
+    });
   }
 
-  // ميثود مساعدة بتطلع الحسابات اللي محتاجين نعمل عليها lock على حسب نوع الـ command
-  private get_affected_accounts(command: ledger_command): string[] {
+  public async getAccountState(
+    accountId: string,
+    session?: ClientSession,
+  ): Promise<AccountStateWithVersion> {
+    const snapshot = await SnapshotModel.findOne({ accountId })
+      .session(session ?? null)
+      .lean();
+
+    const baseState: AccountStateWithVersion = snapshot
+      ? {
+          state: {
+            accountId: snapshot.accountId,
+            type: snapshot.type as AccountType,
+            availableBalance: snapshot.availableBalance,
+            pendingBalance: snapshot.pendingBalance,
+            holds: snapshot.holds as Record<string, HoldInfo>,
+          },
+          version: snapshot.version,
+          lastEventId: snapshot.lastEventId,
+        }
+      : {
+          state: {
+            accountId,
+            type:
+              accountId === INTERNAL_SETTLEMENT_ACCOUNT_ID
+                ? "system"
+                : "customer",
+            availableBalance: 0,
+            pendingBalance: 0,
+            holds: {},
+          },
+          version: 0,
+          lastEventId: "",
+        };
+
+    const events = await EventModel.find({
+      aggregateId: accountId,
+      version: { $gt: baseState.version },
+    })
+      .sort({ version: 1, commandId: 1 })
+      .session(session ?? null)
+      .lean();
+
+    let currentState = baseState.state;
+    let currentVersion = baseState.version;
+    let lastEventId = baseState.lastEventId;
+
+    for (const event of events) {
+      currentState = LedgerEngine.apply_event(currentState, event.data);
+      currentVersion = event.version;
+      lastEventId = event._id?.toString() ?? lastEventId;
+    }
+
+    return {
+      state: currentState,
+      version: currentVersion,
+      lastEventId,
+    };
+  }
+
+  public async accountExists(accountId: string): Promise<boolean> {
+    const count = await SnapshotModel.countDocuments({ accountId }).exec();
+    return count > 0;
+  }
+
+  public async getAccountStatement(
+    accountId: string,
+  ): Promise<AccountStatementLine[]> {
+    const snapshot = await SnapshotModel.findOne({ accountId }).lean();
+    if (!snapshot) {
+      throw new Error("Account not found");
+    }
+
+    const events = await EventModel.find({ aggregateId: accountId })
+      .sort({ version: 1, commandId: 1 })
+      .lean();
+
+    let state: AccountState = {
+      accountId,
+      type: snapshot.type as AccountType,
+      availableBalance: 0,
+      pendingBalance: 0,
+      holds: {},
+    };
+
+    const statement: AccountStatementLine[] = [];
+
+    for (const event of events) {
+      state = LedgerEngine.apply_event(state, event.data);
+      statement.push({
+        eventId: event._id?.toString() ?? "",
+        commandId: event.commandId,
+        timestamp: event.timestamp,
+        type: event.data.type,
+        data: event.data,
+        availableBalance: state.availableBalance,
+        pendingBalance: state.pendingBalance,
+        totalBalance: state.availableBalance + state.pendingBalance,
+      });
+    }
+
+    return statement;
+  }
+
+  public async verifyInvariants(): Promise<InvariantReport> {
+    const errors: string[] = [];
+    let globalBalance = 0;
+
+    const snapshots = await SnapshotModel.find().lean();
+    const allEvents = await EventModel.find().sort({ _id: 1 }).lean();
+
+    const eventsByCommand = new Map<
+      string,
+      Array<(typeof allEvents)[number]>
+    >();
+    for (const event of allEvents) {
+      const group = eventsByCommand.get(event.commandId) ?? [];
+      group.push(event);
+      eventsByCommand.set(event.commandId, group);
+    }
+
+    for (const [commandId, events] of eventsByCommand.entries()) {
+      const delta = events.reduce(
+        (acc, event) => acc + this.balanceDelta(event.data),
+        0,
+      );
+      if (delta !== 0) {
+        errors.push(`Command ${commandId} is not balanced: delta=${delta}`);
+      }
+    }
+
+    for (const snapshot of snapshots) {
+      globalBalance += snapshot.availableBalance + snapshot.pendingBalance;
+
+      if (snapshot.type === "customer" && snapshot.availableBalance < 0) {
+        errors.push(
+          `Customer account ${snapshot.accountId} has negative available balance ${snapshot.availableBalance}`,
+        );
+      }
+
+      const replayed = await this.replayAccountFromSnapshot(
+        snapshot.accountId,
+        snapshot.version,
+      );
+
+      if (
+        replayed.state.availableBalance !== snapshot.availableBalance ||
+        replayed.state.pendingBalance !== snapshot.pendingBalance ||
+        JSON.stringify(replayed.state.holds) !== JSON.stringify(snapshot.holds)
+      ) {
+        errors.push(
+          `Snapshot drift detected for account ${snapshot.accountId}`,
+        );
+      }
+
+      const pendingHoldSum = Object.values(replayed.state.holds)
+        .filter((hold) => hold.status === "pending")
+        .reduce((sum, hold) => sum + hold.amount, 0);
+
+      if (pendingHoldSum !== replayed.state.pendingBalance) {
+        errors.push(
+          `Pending hold mismatch for account ${snapshot.accountId}: expected=${pendingHoldSum} actual=${replayed.state.pendingBalance}`,
+        );
+      }
+    }
+
+    if (globalBalance !== 0) {
+      errors.push(`Closed system global balance is not zero: ${globalBalance}`);
+    }
+
+    return {
+      status: errors.length === 0 ? "SUCCESS" : "FAILED",
+      errors,
+      globalBalance,
+      inspectedAccounts: snapshots.length,
+    };
+  }
+
+  private async replayAccountFromSnapshot(
+    accountId: string,
+    snapshotVersion: number,
+  ): Promise<AccountStateWithVersion> {
+    const snapshot = await SnapshotModel.findOne({ accountId }).lean();
+    const base: AccountStateWithVersion = snapshot
+      ? {
+          state: {
+            accountId,
+            type: snapshot.type as AccountType,
+            availableBalance: snapshot.availableBalance,
+            pendingBalance: snapshot.pendingBalance,
+            holds: snapshot.holds as Record<string, HoldInfo>,
+          },
+          version: snapshot.version,
+          lastEventId: snapshot.lastEventId,
+        }
+      : {
+          state: {
+            accountId,
+            type:
+              accountId === INTERNAL_SETTLEMENT_ACCOUNT_ID
+                ? "system"
+                : "customer",
+            availableBalance: 0,
+            pendingBalance: 0,
+            holds: {},
+          },
+          version: snapshotVersion,
+          lastEventId: "",
+        };
+
+    const events = await EventModel.find({
+      aggregateId: accountId,
+      version: { $gt: base.version },
+    })
+      .sort({ version: 1, commandId: 1 })
+      .lean();
+
+    let state = base.state;
+    let version = base.version;
+    let lastEventId = base.lastEventId;
+
+    for (const event of events) {
+      state = LedgerEngine.apply_event(state, event.data);
+      version = event.version;
+      lastEventId = event._id?.toString() ?? lastEventId;
+    }
+
+    return { state, version, lastEventId };
+  }
+
+  private verifyBalance(events: ReadonlyArray<LedgerEventDocument>): boolean {
+    return (
+      events.reduce((acc, event) => acc + this.balanceDelta(event.data), 0) ===
+      0
+    );
+  }
+
+  private balanceDelta(event: LedgerEventData): number {
+    switch (event.type) {
+      case "account_opened":
+        return 0;
+      case "transfer_debit":
+        return -event.amount;
+      case "transfer_credit":
+        return event.amount;
+      case "hold_placed":
+        return 0;
+      case "hold_captured":
+        return 0;
+      case "hold_voided":
+        return 0;
+      default:
+        const _exhaustive_check: never = event;
+        return 0;
+    }
+  }
+
+  private getAffectedAccounts(command: LedgerCommand): string[] {
     switch (command.type) {
       case "open_account":
         return [command.accountId];
@@ -288,43 +474,32 @@ export class LedgerEngine {
       case "place_hold":
         return [command.accountId];
       case "capture_hold":
-        return [command.accountId, SYSTEM_SETTLEMENT_ACCOUNT_ID];
+        return [command.accountId, INTERNAL_SETTLEMENT_ACCOUNT_ID];
       case "void_hold":
         return [command.accountId];
     }
   }
 
-  // ميثود مساعدة للتأكد من الـ Invariants والـ Overdraft قبل توليد الـ events
-  private validate_and_build_events(
-    command: ledger_command,
-    states: Record<string, { state: account_state; version: number }>,
-    idempotency_key: string,
-  ): Array<{
-    idempotencyKey: string;
-    aggregateId: string;
-    version: number;
-    timestamp: number;
-    data: ledger_event_data;
-  }> {
-    const events: Array<{
-      idempotencyKey: string;
-      aggregateId: string;
-      version: number;
-      timestamp: number;
-      data: ledger_event_data;
-    }> = [];
-    const now = Date.now(); // الـ Timestamp غير الحتمي بيتقري هنا بس وقت الإنشاء وبيتسجل جوه الـ event
+  private buildEvents(
+    command: LedgerCommand,
+    states: Record<string, AccountStateWithVersion>,
+    idempotencyKey: string,
+  ): LedgerEventDocument[] {
+    const now = Date.now();
+    const rows: LedgerEventDocument[] = [];
 
     switch (command.type) {
       case "open_account": {
-        const acc = states[command.accountId];
-        if (acc?.version && acc.version > 0)
+        const account = states[command.accountId];
+        if (!account || account.version !== 0) {
           throw new Error("Account already exists");
+        }
 
-        events.push({
-          idempotencyKey: idempotency_key,
+        rows.push({
+          commandId: idempotencyKey,
+          idempotencyKey: `${idempotencyKey}-open`,
           aggregateId: command.accountId,
-          version: 1,
+          version: account.version + 1,
           timestamp: now,
           data: {
             type: "account_opened",
@@ -334,46 +509,46 @@ export class LedgerEngine {
         });
         break;
       }
-
       case "transfer": {
         const from = states[command.fromAccountId];
         const to = states[command.toAccountId];
-
-        if (!from || !to) throw new Error("One or both accounts do not exist");
-        if (from.version === 0 || to.version === 0)
+        if (!from || !to || from.version === 0 || to.version === 0) {
           throw new Error("One or both accounts do not exist");
-        if (!Number.isInteger(command.amount) || command.amount <= 0)
+        }
+        if (!Number.isInteger(command.amount) || command.amount <= 0) {
           throw new Error("Amount must be a positive integer");
-
+        }
         if (
-          from.state.type === "customer" &&
-          from.state.availableBalance < command.amount
+          !from ||
+          !to ||
+          (from.state.type === "customer" &&
+            from.state.availableBalance < command.amount)
         ) {
-          throw new Error(
-            "Insufficient funds (Overdraft forbidden for customer accounts)",
-          );
+          throw new Error("Insufficient funds for transfer");
         }
 
-        events.push(
+        rows.push(
           {
-            idempotencyKey: `${idempotency_key}-from`,
+            commandId: idempotencyKey,
+            idempotencyKey: `${idempotencyKey}-from`,
             aggregateId: command.fromAccountId,
             version: from.version + 1,
             timestamp: now,
             data: {
-              type: "money_transferred",
+              type: "transfer_debit",
               fromAccountId: command.fromAccountId,
               toAccountId: command.toAccountId,
               amount: command.amount,
             },
           },
           {
-            idempotencyKey: `${idempotency_key}-to`,
+            commandId: idempotencyKey,
+            idempotencyKey: `${idempotencyKey}-to`,
             aggregateId: command.toAccountId,
             version: to.version + 1,
             timestamp: now,
             data: {
-              type: "money_transferred",
+              type: "transfer_credit",
               fromAccountId: command.fromAccountId,
               toAccountId: command.toAccountId,
               amount: command.amount,
@@ -382,24 +557,33 @@ export class LedgerEngine {
         );
         break;
       }
-
       case "place_hold": {
-        const acc = states[command.accountId];
-        if (!acc || acc.version === 0)
+        const account = states[command.accountId];
+        if (!account || account.version === 0) {
           throw new Error("Account does not exist");
-        if (!Number.isInteger(command.amount) || command.amount <= 0)
+        }
+        if (!Number.isInteger(command.amount) || command.amount <= 0) {
           throw new Error("Hold amount must be a positive integer");
+        }
         if (
-          acc.state.type === "customer" &&
-          acc.state.availableBalance < command.amount
+          !account ||
+          (account.state.type === "customer" &&
+            account.state.availableBalance < command.amount)
         ) {
           throw new Error("Insufficient funds for hold");
         }
+        if (!account) {
+          throw new Error("Account does not exist");
+        }
+        if (account.state.holds[command.holdId]) {
+          throw new Error("Hold already exists");
+        }
 
-        events.push({
-          idempotencyKey: idempotency_key,
+        rows.push({
+          commandId: idempotencyKey,
+          idempotencyKey: `${idempotencyKey}-hold`,
           aggregateId: command.accountId,
-          version: acc.version + 1,
+          version: account.version + 1,
           timestamp: now,
           data: {
             type: "hold_placed",
@@ -410,72 +594,175 @@ export class LedgerEngine {
         });
         break;
       }
-
       case "capture_hold": {
-        const acc = states[command.accountId];
-        const systemAcc = states[SYSTEM_SETTLEMENT_ACCOUNT_ID];
-        if (!acc || acc.version === 0)
+        const account = states[command.accountId];
+        if (!account || account.version === 0) {
           throw new Error("Account does not exist");
-        if (!systemAcc)
-          throw new Error("System settlement account is unavailable.");
-
-        const hold = acc.state.holds?.[command.holdId];
-        if (!hold || hold.status !== "pending")
+        }
+        const hold = account.state.holds[command.holdId];
+        if (!hold || hold.status !== "pending") {
           throw new Error("Hold not found or not pending");
+        }
 
-        events.push(
+        const systemAccount = states[INTERNAL_SETTLEMENT_ACCOUNT_ID];
+        if (!systemAccount) {
+          throw new Error("Internal settlement account state unavailable");
+        }
+
+        rows.push(
           {
-            idempotencyKey: idempotency_key,
+            commandId: idempotencyKey,
+            idempotencyKey: `${idempotencyKey}-capture`,
             aggregateId: command.accountId,
-            version: acc.version + 1,
+            version: account.version + 1,
             timestamp: now,
             data: {
               type: "hold_captured",
-              holdId: command.holdId,
               accountId: command.accountId,
+              holdId: command.holdId,
               amount: hold.amount,
             },
           },
           {
-            idempotencyKey: `${idempotency_key}-system`,
-            aggregateId: SYSTEM_SETTLEMENT_ACCOUNT_ID,
-            version: systemAcc.version + 1,
+            commandId: idempotencyKey,
+            idempotencyKey: `${idempotencyKey}-settlement`,
+            aggregateId: INTERNAL_SETTLEMENT_ACCOUNT_ID,
+            version: systemAccount.version + 1,
             timestamp: now,
             data: {
-              type: "money_transferred",
+              type: "transfer_credit",
               fromAccountId: command.accountId,
-              toAccountId: SYSTEM_SETTLEMENT_ACCOUNT_ID,
+              toAccountId: INTERNAL_SETTLEMENT_ACCOUNT_ID,
               amount: hold.amount,
             },
           },
         );
         break;
       }
-
       case "void_hold": {
-        const acc = states[command.accountId];
-        if (!acc || acc.version === 0)
+        const account = states[command.accountId];
+        if (!account || account.version === 0) {
           throw new Error("Account does not exist");
-        const hold = acc.state.holds?.[command.holdId];
-        if (!hold || hold.status !== "pending")
+        }
+        const hold = account.state.holds[command.holdId];
+        if (!hold || hold.status !== "pending") {
           throw new Error("Hold not found or not pending");
+        }
 
-        events.push({
-          idempotencyKey: idempotency_key,
+        rows.push({
+          commandId: idempotencyKey,
+          idempotencyKey: `${idempotencyKey}-void`,
           aggregateId: command.accountId,
-          version: acc.version + 1,
+          version: account.version + 1,
           timestamp: now,
           data: {
             type: "hold_voided",
-            holdId: command.holdId,
             accountId: command.accountId,
+            holdId: command.holdId,
             amount: hold.amount,
           },
         });
         break;
       }
+      default:
+        const _exhaustive_check: never = command;
+        throw new Error("Unhandled command type");
     }
 
-    return events;
+    return rows;
+  }
+
+  private async executeWithRetry(
+    work: (session: ClientSession) => Promise<ProcessResult>,
+    attempt = 0,
+  ): Promise<ProcessResult> {
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const result = await work(session);
+      await session.commitTransaction();
+      return result;
+    } catch (error: unknown) {
+      await session.abortTransaction().catch(() => undefined);
+      if (attempt < TRANSACTION_RETRY_LIMIT && this.isTransientError(error)) {
+        return this.executeWithRetry(work, attempt + 1);
+      }
+      throw error;
+    } finally {
+      session.endSession();
+    }
+  }
+
+  private isTransientError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    return /E11000|duplicate key|WriteConflict|Transaction.*aborted|TransientTransactionError|UnknownTransactionCommitResult/i.test(
+      error.message,
+    );
+  }
+
+  public static apply_event(
+    state: AccountState,
+    event: LedgerEventData,
+  ): AccountState {
+    const nextState = JSON.parse(JSON.stringify(state)) as AccountState;
+
+    switch (event.type) {
+      case "account_opened":
+        nextState.type = event.accountType;
+        nextState.availableBalance = 0;
+        nextState.pendingBalance = 0;
+        nextState.holds = {};
+        break;
+      case "transfer_debit":
+        if (nextState.accountId === event.fromAccountId) {
+          nextState.availableBalance -= event.amount;
+        }
+        break;
+      case "transfer_credit":
+        if (nextState.accountId === event.toAccountId) {
+          nextState.availableBalance += event.amount;
+        }
+        break;
+      case "hold_placed":
+        if (nextState.accountId === event.accountId) {
+          nextState.availableBalance -= event.amount;
+          nextState.pendingBalance += event.amount;
+          nextState.holds = nextState.holds || {};
+          nextState.holds[event.holdId] = {
+            holdId: event.holdId,
+            accountId: event.accountId,
+            amount: event.amount,
+            status: "pending",
+          };
+        }
+        break;
+      case "hold_captured":
+        if (nextState.accountId === event.accountId) {
+          const hold = nextState.holds?.[event.holdId];
+          if (hold && hold.status === "pending") {
+            nextState.pendingBalance -= event.amount;
+            hold.status = "captured";
+          }
+        }
+        break;
+      case "hold_voided":
+        if (nextState.accountId === event.accountId) {
+          const hold = nextState.holds?.[event.holdId];
+          if (hold && hold.status === "pending") {
+            nextState.availableBalance += event.amount;
+            nextState.pendingBalance -= event.amount;
+            hold.status = "voided";
+          }
+        }
+        break;
+      default:
+        const _exhaustive_check: never = event;
+        throw new Error("Unhandled event type");
+    }
+
+    return nextState;
   }
 }

@@ -10,4 +10,5 @@ export interface ISnapshot extends Document {
     string,
     { amount: number; status: "pending" | "captured" | "voided" }
   >;
+  lastEventId: string;
 }

@@ -6,9 +6,15 @@ export const IdempotencySchema = new Schema({
     required: true,
     unique: true,
   },
+  status: {
+    type: String,
+    required: true,
+    enum: ["processing", "completed", "failed"],
+    default: "processing",
+  },
   response: {
     type: Schema.Types.Mixed,
-    required: true,
+    default: null,
   },
   createdAt: {
     type: Date,
@@ -17,4 +23,4 @@ export const IdempotencySchema = new Schema({
   }, // Expire entries after 24h
 });
 
-export const IdempotencyModel = model('Idempotency', IdempotencySchema);
+export const IdempotencyModel = model("Idempotency", IdempotencySchema);

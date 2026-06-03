@@ -5,7 +5,9 @@ import type {
   account_state,
   account_type,
   ledger_command,
+  ledger_event_data,
 } from "../ledger/engine.js";
+import { ApiError } from "../middlewares/error.handler.middleware.js";
 import { SnapshotModel } from "../DB/models/snapshot.model.js";
 import { EventModel } from "../DB/models/event.model.js";
 
@@ -28,66 +30,70 @@ export class LedgerController {
         .json({ error: "missing required 'Idempotency-Key' header" });
     }
 
-    // بدء الـ Session والـ Transaction على مستوى الـ MongoDB
-    const session = await mongoose.startSession();
-    let transactionStarted = false;
+    const shouldRetryError = (err: any) => {
+      return (
+        err?.code === 11000 ||
+        err?.code === 112 ||
+        err?.errorLabels?.includes("TransientTransactionError") ||
+        err?.errorLabels?.includes("UnknownTransactionCommitResult") ||
+        /write conflict/i.test(err?.message || "")
+      );
+    };
 
     const isTransactionUnsupported = (err: any) =>
       err?.message?.includes(
         "Transaction numbers are only allowed on a replica set member or mongos",
       );
 
-    try {
-      console.log("LedgerController: attempting to start transaction");
-      await session.startTransaction();
-      transactionStarted = true;
-      console.log("LedgerController: transaction started");
-    } catch (transactionError: any) {
-      console.warn(
-        "MongoDB transactions unavailable, continuing without transaction:",
-        transactionError.message,
-      );
-    }
+    const maxAttempts = 3;
 
-    try {
-      console.log(
-        "LedgerController: executing command with transactionStarted=",
-        transactionStarted,
-      );
-      const result = await engine.process_command(
-        command,
-        idempotency_key,
-        transactionStarted ? session : undefined,
-      );
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const session = await mongoose.startSession();
+      let transactionStarted = false;
 
-      if (transactionStarted) {
-        try {
-          await session.commitTransaction();
-        } catch (commitError: any) {
-          if (!isTransactionUnsupported(commitError)) {
-            throw commitError;
-          }
-          console.warn(
-            "Ignored unsupported transaction commit on standalone MongoDB:",
-            commitError.message,
-          );
-        }
+      try {
+        await session.startTransaction();
+        transactionStarted = true;
+      } catch (transactionError: any) {
+        await session.endSession();
+        throw new ApiError(
+          "MongoDB transactions are required for safe ledger operations. Please use a replica set or sharded cluster.",
+          500,
+        );
       }
-      return res.status(200).json(result);
-    } catch (error: any) {
-      if (transactionStarted) {
+
+      try {
+        const result = await engine.process_command(
+          command,
+          idempotency_key,
+          session,
+        );
+
+        await session.commitTransaction();
+        return res.status(200).json(result);
+      } catch (error: any) {
         try {
-          await session.abortTransaction();
+          if (transactionStarted) {
+            await session.abortTransaction();
+          }
         } catch (abortError: any) {
-          if (!isTransactionUnsupported(abortError)) {
-            console.warn("Abort transaction failed:", abortError.message);
-          }
+          console.warn("Abort transaction failed:", abortError.message);
+        } finally {
+          session.endSession();
         }
+
+        if (shouldRetryError(error) && attempt < maxAttempts) {
+          continue;
+        }
+
+        const statusCode = error.statusCode || 400;
+        return res.status(statusCode).json({ error: error.message });
       }
-      return res.status(400).json({ error: error.message });
-    } finally {
-      session.endSession();
     }
+
+    return res
+      .status(500)
+      .json({ error: "Ledger request could not complete after retries." });
   }
 
   // POST /accounts
@@ -198,15 +204,15 @@ export class LedgerController {
         for (const ev of all_account_events) {
           replayed_state = LedgerEngine.apply_event(
             replayed_state,
-            ev.data as any,
+            ev.data as ledger_event_data,
           );
         }
 
         const current_db_state = {
-          account_id: snap.accountId,
+          accountId: snap.accountId,
           type: snap.type,
-          available_balance: snap.availableBalance,
-          pending_balance: snap.pendingBalance,
+          availableBalance: snap.availableBalance,
+          pendingBalance: snap.pendingBalance,
           holds: snap.holds || {},
         };
 

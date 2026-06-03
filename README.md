@@ -56,8 +56,9 @@ Events are also discriminated unions and include:
 
 ### Transaction handling
 
-The HTTP controller in `src/controllers/ledger.controller.ts` attempts to use MongoDB sessions and transactions.
-If transactions are unavailable, it falls back to a session-aware path while still preserving idempotency and snapshot updates as much as possible.
+The HTTP controller in `src/controllers/ledger.controller.ts` requires MongoDB transactions for atomic multi-aggregate operations.
+This means the database must run as a replica set or sharded cluster; standalone MongoDB instances are not safe for transfers and hold captures.
+The code rejects requests if transaction support is unavailable, protecting against half-completed transfers and broken zero-sum invariants.
 
 ### Idempotency
 
@@ -112,6 +113,8 @@ npm install
 PORT=3000
 MONGODB_URI=mongodb://localhost:27017/core-ledger
 ```
+
+> Note: MongoDB must run as a replica set or sharded cluster for transactional safety. For local development use `mongod --replSet rs0` and initialize the replica set before starting the service.
 
 3. Build the project:
 

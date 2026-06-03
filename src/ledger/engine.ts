@@ -2,6 +2,9 @@ import type { ClientSession } from "mongoose";
 import { EventModel } from "../DB/models/event.model.js";
 import { SnapshotModel } from "../DB/models/snapshot.model.js";
 import { IdempotencyModel } from "../DB/models/idempotency.model.js";
+import { ApiError } from "../middlewares/error.handler.middleware.js";
+
+const SYSTEM_SETTLEMENT_ACCOUNT_ID = "__system_settlement__";
 
 // --- الـ Types المكتوبة بـ small/snake_case عشان تناسب معاييرك ---
 
@@ -146,7 +149,8 @@ export class LedgerEngine {
         }
       : {
           accountId: account_id,
-          type: "customer",
+          type:
+            account_id === SYSTEM_SETTLEMENT_ACCOUNT_ID ? "system" : "customer",
           availableBalance: 0,
           pendingBalance: 0,
           holds: {},
@@ -183,14 +187,38 @@ export class LedgerEngine {
     idempotency_key: string,
     session?: ClientSession,
   ): Promise<any> {
-    // تشك على الـ Idempotency أولاً لمنع تكرار الحركات المتزامنة
-    const existing_record = await IdempotencyModel.findOne({
-      idempotencyKey: idempotency_key,
-    })
-      .session(session ?? null)
-      .lean();
-    if (existing_record) {
-      return existing_record.response;
+    const sessionOptions = session ? { session } : undefined;
+
+    const upsertResult: any = await IdempotencyModel.findOneAndUpdate<any>(
+      { idempotencyKey: idempotency_key } as any,
+      {
+        $setOnInsert: {
+          idempotencyKey: idempotency_key,
+          status: "processing",
+          createdAt: new Date(),
+        },
+      },
+      {
+        upsert: true,
+        new: true,
+        rawResult: true,
+        session: session ?? null,
+        setDefaultsOnInsert: true,
+      },
+    );
+
+    const idempotency_record = upsertResult.value as {
+      status: string;
+      response: unknown;
+    } | null;
+    const wasInserted = upsertResult.lastErrorObject?.updatedExisting === false;
+
+    if (idempotency_record?.status === "completed") {
+      return idempotency_record.response;
+    }
+
+    if (!wasInserted && idempotency_record?.status === "processing") {
+      throw new ApiError("Idempotency key is already in progress", 409);
     }
 
     // تجميع الحسابات المتأثرة بالأمر ده
@@ -216,12 +244,9 @@ export class LedgerEngine {
     );
 
     // تسجيل الأحداث وتحديث الـ Snapshots دورياً (Compaction) داخل الـ Session
-    const sessionOptions = session ? { session } : undefined;
-
     for (const out_event of generated_events) {
       await EventModel.create([out_event], sessionOptions);
 
-      // هنجيب الـ State الجديدة بعد ما ضفنا الـ event عشان نسيف الـ Snapshot المحدث فوراً
       const target_id = out_event.aggregateId;
       const { state: updated_state } = await this.get_account_state(
         target_id,
@@ -243,11 +268,11 @@ export class LedgerEngine {
       );
     }
 
-    // حفظ رد الـ Idempotency عشان لو نفس المفتاح اتبعت تاني
     const response_data = { success: true, command: command.type };
-    await IdempotencyModel.create(
-      [{ idempotencyKey: idempotency_key, response: response_data }],
-      sessionOptions,
+    await IdempotencyModel.updateOne(
+      { idempotencyKey: idempotency_key },
+      { $set: { status: "completed", response: response_data } },
+      session ? { session } : undefined,
     );
 
     return response_data;
@@ -263,6 +288,7 @@ export class LedgerEngine {
       case "place_hold":
         return [command.accountId];
       case "capture_hold":
+        return [command.accountId, SYSTEM_SETTLEMENT_ACCOUNT_ID];
       case "void_hold":
         return [command.accountId];
     }
@@ -273,8 +299,20 @@ export class LedgerEngine {
     command: ledger_command,
     states: Record<string, { state: account_state; version: number }>,
     idempotency_key: string,
-  ): any[] {
-    const events: any[] = [];
+  ): Array<{
+    idempotencyKey: string;
+    aggregateId: string;
+    version: number;
+    timestamp: number;
+    data: ledger_event_data;
+  }> {
+    const events: Array<{
+      idempotencyKey: string;
+      aggregateId: string;
+      version: number;
+      timestamp: number;
+      data: ledger_event_data;
+    }> = [];
     const now = Date.now(); // الـ Timestamp غير الحتمي بيتقري هنا بس وقت الإنشاء وبيتسجل جوه الـ event
 
     switch (command.type) {
@@ -304,10 +342,9 @@ export class LedgerEngine {
         if (!from || !to) throw new Error("One or both accounts do not exist");
         if (from.version === 0 || to.version === 0)
           throw new Error("One or both accounts do not exist");
-        if (command.amount <= 0)
-          throw new Error("Amount must be greater than zero");
+        if (!Number.isInteger(command.amount) || command.amount <= 0)
+          throw new Error("Amount must be a positive integer");
 
-        // فرض الـ Overdraft rules: لو حساب عميل، ممنوع ينزل تحت الصفر نهائياً
         if (
           from.state.type === "customer" &&
           from.state.availableBalance < command.amount
@@ -350,6 +387,8 @@ export class LedgerEngine {
         const acc = states[command.accountId];
         if (!acc || acc.version === 0)
           throw new Error("Account does not exist");
+        if (!Number.isInteger(command.amount) || command.amount <= 0)
+          throw new Error("Hold amount must be a positive integer");
         if (
           acc.state.type === "customer" &&
           acc.state.availableBalance < command.amount
@@ -374,24 +413,42 @@ export class LedgerEngine {
 
       case "capture_hold": {
         const acc = states[command.accountId];
+        const systemAcc = states[SYSTEM_SETTLEMENT_ACCOUNT_ID];
         if (!acc || acc.version === 0)
           throw new Error("Account does not exist");
+        if (!systemAcc)
+          throw new Error("System settlement account is unavailable.");
+
         const hold = acc.state.holds?.[command.holdId];
         if (!hold || hold.status !== "pending")
           throw new Error("Hold not found or not pending");
 
-        events.push({
-          idempotencyKey: idempotency_key,
-          aggregateId: command.accountId,
-          version: acc.version + 1,
-          timestamp: now,
-          data: {
-            type: "hold_captured",
-            holdId: command.holdId,
-            accountId: command.accountId,
-            amount: hold.amount,
+        events.push(
+          {
+            idempotencyKey: idempotency_key,
+            aggregateId: command.accountId,
+            version: acc.version + 1,
+            timestamp: now,
+            data: {
+              type: "hold_captured",
+              holdId: command.holdId,
+              accountId: command.accountId,
+              amount: hold.amount,
+            },
           },
-        });
+          {
+            idempotencyKey: `${idempotency_key}-system`,
+            aggregateId: SYSTEM_SETTLEMENT_ACCOUNT_ID,
+            version: systemAcc.version + 1,
+            timestamp: now,
+            data: {
+              type: "money_transferred",
+              fromAccountId: command.accountId,
+              toAccountId: SYSTEM_SETTLEMENT_ACCOUNT_ID,
+              amount: hold.amount,
+            },
+          },
+        );
         break;
       }
 
